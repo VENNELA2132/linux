@@ -1134,6 +1134,7 @@ struct netvsc_channel {
 	void *recv_buf; /* buffer to copy packets out from the receive buffer */
 	const struct vmpacket_descriptor *desc;
 	struct napi_struct napi;
+	atomic_t napi_enabled;
 	struct multi_send_data msd;
 	struct multi_recv_comp mrc;
 	atomic_t queue_sends;
@@ -1146,6 +1147,21 @@ struct netvsc_channel {
 	struct netvsc_stats_tx tx_stats;
 	struct netvsc_stats_rx rx_stats;
 };
+
+/* Disable the NAPI of a netvsc channel exactly once.
+ *
+ * The subchannel fallback and device removal paths can race and both decide
+ * to disable the same NAPI.  Claim the disable atomically so the second caller
+ * does not enter napi_disable() after the first one has already disabled it.
+ */
+static inline bool netvsc_napi_disable(struct netvsc_channel *nvchan)
+{
+	if (atomic_cmpxchg(&nvchan->napi_enabled, 1, 0) != 1)
+		return false;
+
+	napi_disable(&nvchan->napi);
+	return true;
+}
 
 /* Per netvsc device */
 struct netvsc_device {

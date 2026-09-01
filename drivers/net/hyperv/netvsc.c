@@ -135,8 +135,13 @@ static void netvsc_subchan_work(struct work_struct *w)
 			netif_device_attach(rdev->ndev);
 		} else {
 			/* fallback to only primary channel */
-			for (i = 1; i < nvdev->num_chn; i++)
-				netif_napi_del(&nvdev->chan_table[i].napi);
+			for (i = 1; i < nvdev->num_chn; i++) {
+				struct netvsc_channel *nvchan =
+					&nvdev->chan_table[i];
+
+				netvsc_napi_disable(nvchan);
+				netif_napi_del(&nvchan->napi);
+			}
 
 			nvdev->max_chn = 1;
 			nvdev->num_chn = 1;
@@ -737,12 +742,15 @@ void netvsc_device_remove(struct hv_device *device)
 
 	/* Disable NAPI and disassociate its context from the device. */
 	for (i = 0; i < net_device->num_chn; i++) {
+		struct netvsc_channel *nvchan = &net_device->chan_table[i];
+
 		/* See also vmbus_reset_channel_cb(). */
 		/* only disable enabled NAPI channel */
-		if (i < ndev->real_num_rx_queues)
-			napi_disable(&net_device->chan_table[i].napi);
+		if (i < ndev->real_num_rx_queues &&
+		    atomic_read(&nvchan->napi_enabled))
+			netvsc_napi_disable(nvchan);
 
-		netif_napi_del(&net_device->chan_table[i].napi);
+		netif_napi_del(&nvchan->napi);
 	}
 
 	/*
@@ -1861,6 +1869,7 @@ struct netvsc_device *netvsc_device_add(struct hv_device *device,
 	netdev_dbg(ndev, "hv_netvsc channel opened successfully\n");
 
 	napi_enable(&net_device->chan_table[0].napi);
+	atomic_set(&net_device->chan_table[0].napi_enabled, 1);
 
 	/* Connect with the NetVsp */
 	ret = netvsc_connect_vsp(device, net_device, device_info);
@@ -1879,7 +1888,7 @@ struct netvsc_device *netvsc_device_add(struct hv_device *device,
 
 close:
 	RCU_INIT_POINTER(net_device_ctx->nvdev, NULL);
-	napi_disable(&net_device->chan_table[0].napi);
+	netvsc_napi_disable(&net_device->chan_table[0]);
 
 	/* Now, we can close the channel safely */
 	vmbus_close(device->channel);
