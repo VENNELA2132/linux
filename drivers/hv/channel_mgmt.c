@@ -568,6 +568,21 @@ err_deq_chan:
 	 */
 	newchannel->probe_done = true;
 
+	/*
+	 * vmbus_onoffer_rescind() may have taken a reference to this channel
+	 * already, in which case it is going to remove it from the list and
+	 * free it once it observes probe_done above.  Doing that here as well
+	 * would remove the channel twice and free it twice.
+	 *
+	 * This can only be handed over for a sub channel: for a primary
+	 * channel the rescind handler has nothing to remove it with, because
+	 * device_obj is either NULL or already gone by this point.
+	 */
+	if (primary_channel != NULL && newchannel->rescind_ref) {
+		mutex_unlock(&vmbus_connection.channel_mutex);
+		return;
+	}
+
 	if (primary_channel == NULL)
 		list_del(&newchannel->listentry);
 	else
