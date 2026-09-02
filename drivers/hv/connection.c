@@ -178,8 +178,20 @@ int vmbus_connect(void)
 		goto cleanup;
 	}
 
+	/*
+	 * Rescind messages for different devices must be able to make
+	 * progress independently of each other, so this workqueue is
+	 * created with an unbounded concurrency level rather than with
+	 * create_workqueue(), which would limit it to one work item per
+	 * CPU.  vmbus_onoffer_rescind() is safe to run concurrently.
+	 *
+	 * WQ_MEM_RECLAIM is deliberately not set: rescind processing is
+	 * device teardown, it is not needed to make progress during
+	 * memory reclaim, and it flushes workqueues belonging to the
+	 * drivers being torn down, which do not set WQ_MEM_RECLAIM.
+	 */
 	vmbus_connection.rescind_work_queue =
-		create_workqueue("hv_vmbus_rescind");
+		alloc_workqueue("hv_vmbus_rescind", WQ_UNBOUND, 0);
 	if (!vmbus_connection.rescind_work_queue) {
 		ret = -ENOMEM;
 		goto cleanup;
