@@ -996,6 +996,37 @@ static int vmbus_close_internal(struct vmbus_channel *channel)
 	return ret;
 }
 
+/*
+ * Claim the next sub channel that has not been visited yet, or return NULL
+ * once every one of them has been.
+ *
+ * The list has to be re-read under channel_mutex on every round.  The caller
+ * sleeps in wait_for_completion(), and both vmbus_onoffer_rescind() and the
+ * error path of vmbus_add_channel_work() remove entries from sc_list while it
+ * sleeps, so a next pointer cached across that sleep, as
+ * list_for_each_entry_safe() keeps, can be freed and then dereferenced.
+ *
+ * closer_owns doubles as the visited marker.  It is set here under the mutex,
+ * and both of those paths honour it, so a claimed channel is neither freed
+ * behind the caller's back nor handed out to it twice.
+ */
+static struct vmbus_channel *vmbus_claim_next_sc(struct vmbus_channel *primary)
+{
+	struct vmbus_channel *sc, *claimed = NULL;
+
+	mutex_lock(&vmbus_connection.channel_mutex);
+	list_for_each_entry(sc, &primary->sc_list, sc_list) {
+		if (!sc->closer_owns) {
+			sc->closer_owns = true;
+			claimed = sc;
+			break;
+		}
+	}
+	mutex_unlock(&vmbus_connection.channel_mutex);
+
+	return claimed;
+}
+
 /* disconnect ring - close all channels */
 int vmbus_disconnect_ring(struct vmbus_channel *channel)
 {
@@ -1005,19 +1036,56 @@ int vmbus_disconnect_ring(struct vmbus_channel *channel)
 	if (channel->primary_channel != NULL)
 		return -EINVAL;
 
-	list_for_each_entry_safe(cur_channel, tmp, &channel->sc_list, sc_list) {
-		if (cur_channel->rescind)
+	while ((cur_channel = vmbus_claim_next_sc(channel)) != NULL) {
+		if (cur_channel->rescind) {
+			/*
+			 * The channel is claimed, so vmbus_onoffer_rescind()
+			 * completes rescind_event instead of taking ownership
+			 * and freeing the channel itself, and this wait always
+			 * makes progress.
+			 */
 			wait_for_completion(&cur_channel->rescind_event);
+		}
 
 		mutex_lock(&vmbus_connection.channel_mutex);
-		if (vmbus_close_internal(cur_channel) == 0) {
+
+		ret = vmbus_close_internal(cur_channel);
+		if (ret == 0)
 			vmbus_free_ring(cur_channel);
 
-			if (cur_channel->rescind)
-				hv_process_channel_removal(cur_channel);
-		}
+		/*
+		 * Free the channel if it was rescinded: either the close
+		 * succeeded, or it refused a channel that was never open,
+		 * e.g. one whose vmbus_open() failed, and the rescind handler
+		 * left the teardown to this thread because the channel was
+		 * claimed.  Missing the latter case leaks the relid, which is
+		 * then never released back to the host, and the next hot-add
+		 * of the device fails.
+		 */
+		if (cur_channel->rescind)
+			hv_process_channel_removal(cur_channel);
+
 		mutex_unlock(&vmbus_connection.channel_mutex);
 	}
+
+	/*
+	 * Release the claim on the sub channels that are still listed, i.e.
+	 * the ones that were not rescinded and so were not freed above.  A
+	 * rescind arriving from here on has to be free to tear them down
+	 * itself.  One that arrived while they were still claimed only
+	 * completed rescind_event, so those have to be freed here instead.
+	 */
+	mutex_lock(&vmbus_connection.channel_mutex);
+	list_for_each_entry_safe(cur_channel, tmp, &channel->sc_list, sc_list) {
+		if (!cur_channel->closer_owns)
+			continue;
+
+		if (cur_channel->rescind)
+			hv_process_channel_removal(cur_channel);
+		else
+			cur_channel->closer_owns = false;
+	}
+	mutex_unlock(&vmbus_connection.channel_mutex);
 
 	/*
 	 * Now close the primary.
