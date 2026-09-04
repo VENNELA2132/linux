@@ -128,6 +128,28 @@ static void put_rndis_request(struct rndis_device *dev,
 	kfree(req);
 }
 
+static bool netvsc_channel_rescinded(struct net_device *ndev)
+{
+	struct net_device_context *ndev_ctx = netdev_priv(ndev);
+
+	return ndev_ctx->device_ctx->channel->rescind;
+}
+
+static int rndis_wait_for_response(struct rndis_device *dev,
+				   struct rndis_request *request)
+{
+	while (!wait_for_completion_timeout(&request->wait_event, HZ)) {
+		if (netvsc_channel_rescinded(dev->ndev)) {
+			netdev_err(dev->ndev,
+				   "RNDIS request 0x%x aborted, channel rescinded\n",
+				   request->request_msg.ndis_msg_type);
+			return -ENODEV;
+		}
+	}
+
+	return 0;
+}
+
 static void dump_rndis_message(struct net_device *netdev,
 			       const struct rndis_message *rndis_msg,
 			       const void *data)
@@ -696,7 +718,9 @@ static int rndis_filter_query_device(struct rndis_device *dev,
 	if (ret != 0)
 		goto cleanup;
 
-	wait_for_completion(&request->wait_event);
+	ret = rndis_wait_for_response(dev, request);
+	if (ret != 0)
+		goto cleanup;
 
 	/* Copy the response back */
 	query_complete = &request->response_msg.msg.query_complete;
@@ -836,7 +860,9 @@ int rndis_filter_set_device_mac(struct netvsc_device *nvdev,
 	if (ret != 0)
 		goto cleanup;
 
-	wait_for_completion(&request->wait_event);
+	ret = rndis_wait_for_response(rdev, request);
+	if (ret != 0)
+		goto cleanup;
 
 	set_complete = &request->response_msg.msg.set_complete;
 	if (set_complete->status != RNDIS_STATUS_SUCCESS)
@@ -892,7 +918,10 @@ rndis_filter_set_offload_params(struct net_device *ndev,
 	if (ret != 0)
 		goto cleanup;
 
-	wait_for_completion(&request->wait_event);
+	ret = rndis_wait_for_response(rdev, request);
+	if (ret != 0)
+		goto cleanup;
+
 	set_complete = &request->response_msg.msg.set_complete;
 	if (set_complete->status != RNDIS_STATUS_SUCCESS) {
 		netdev_err(ndev, "Fail to set offload on host side:0x%x\n",
@@ -959,7 +988,10 @@ static int rndis_set_rss_param_msg(struct rndis_device *rdev,
 	if (ret != 0)
 		goto cleanup;
 
-	wait_for_completion(&request->wait_event);
+	ret = rndis_wait_for_response(rdev, request);
+	if (ret != 0)
+		goto cleanup;
+
 	set_complete = &request->response_msg.msg.set_complete;
 	if (set_complete->status == RNDIS_STATUS_SUCCESS) {
 		if (!(flag & NDIS_RSS_PARAM_FLAG_DISABLE_RSS) &&
@@ -1047,8 +1079,9 @@ static int rndis_filter_set_packet_filter(struct rndis_device *dev,
 
 	ret = rndis_filter_send_request(dev, request);
 	if (ret == 0) {
-		wait_for_completion(&request->wait_event);
-		dev->filter = new_filter;
+		ret = rndis_wait_for_response(dev, request);
+		if (ret == 0)
+			dev->filter = new_filter;
 	}
 
 	put_rndis_request(dev, request);
@@ -1112,7 +1145,11 @@ static int rndis_filter_init_device(struct rndis_device *dev,
 		goto cleanup;
 	}
 
-	wait_for_completion(&request->wait_event);
+	ret = rndis_wait_for_response(dev, request);
+	if (ret != 0) {
+		dev->state = RNDIS_DEV_UNINITIALIZED;
+		goto cleanup;
+	}
 
 	init_complete = &request->response_msg.msg.init_complete;
 	status = init_complete->status;
@@ -1177,8 +1214,15 @@ cleanup:
 	/* Force flag to be ordered before waiting */
 	wmb();
 
-	/* Wait for all send completions */
-	wait_event(nvdev->wait_drain, netvsc_device_idle(nvdev));
+	while (true) {
+		wait_event_timeout(nvdev->wait_drain,
+				   netvsc_device_idle(nvdev) ||
+				   netvsc_channel_rescinded(dev->ndev),
+				   HZ);
+		if (netvsc_device_idle(nvdev) ||
+		    netvsc_channel_rescinded(dev->ndev))
+			break;
+	}
 
 	if (request)
 		put_rndis_request(dev, request);
@@ -1301,7 +1345,13 @@ int rndis_set_subchannel(struct net_device *ndev,
 		return ret;
 	}
 
-	wait_for_completion(&nvdev->channel_init_wait);
+	while (!wait_for_completion_timeout(&nvdev->channel_init_wait, HZ)) {
+		if (netvsc_channel_rescinded(ndev)) {
+			netdev_err(ndev, "sub channel allocate aborted, channel rescinded\n");
+			return -ENODEV;
+		}
+	}
+
 	if (init_packet->msg.v5_msg.subchn_comp.status != NVSP_STAT_SUCCESS) {
 		netdev_err(ndev, "sub channel request failed\n");
 		return -EIO;
@@ -1315,9 +1365,18 @@ int rndis_set_subchannel(struct net_device *ndev,
 	nvdev->num_chn = 1 +
 		init_packet->msg.v5_msg.subchn_comp.num_subchannels;
 
-	/* wait for all sub channels to open */
-	wait_event(nvdev->subchan_open,
-		   atomic_read(&nvdev->open_chn) == nvdev->num_chn);
+	while (atomic_read(&nvdev->open_chn) != nvdev->num_chn &&
+	       !netvsc_channel_rescinded(ndev)) {
+		wait_event_timeout(nvdev->subchan_open,
+				   atomic_read(&nvdev->open_chn) == nvdev->num_chn ||
+				   netvsc_channel_rescinded(ndev),
+				   HZ);
+	}
+
+	if (netvsc_channel_rescinded(ndev)) {
+		netdev_err(ndev, "sub channel open aborted, channel rescinded\n");
+		return -ENODEV;
+	}
 
 	/* open_chn counts callbacks rather than successful opens.  If no sub
 	 * channel opened, do not send another request to a device that is

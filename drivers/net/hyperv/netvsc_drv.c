@@ -2382,6 +2382,20 @@ static int netvsc_register_vf(struct net_device *vf_netdev, int context)
 	return NOTIFY_OK;
 }
 
+static bool netvsc_wait_for_vf_add(struct net_device *ndev,
+				   struct net_device_context *ndev_ctx)
+{
+	while (!wait_for_completion_timeout(&ndev_ctx->vf_add, HZ)) {
+		if (ndev_ctx->device_ctx->channel->rescind) {
+			netdev_err(ndev,
+				   "VF association aborted, channel rescinded\n");
+			return false;
+		}
+	}
+
+	return true;
+}
+
 /* Change the data path when VF UP/DOWN/CHANGE are detected.
  *
  * Typically a UP or DOWN event is followed by a CHANGE event, so
@@ -2417,7 +2431,8 @@ static int netvsc_vf_changed(struct net_device *vf_netdev, unsigned long event)
 
 	if (vf_is_up && !net_device_ctx->vf_alloc) {
 		netdev_info(ndev, "Waiting for the VF association from host\n");
-		wait_for_completion(&net_device_ctx->vf_add);
+		if (!netvsc_wait_for_vf_add(ndev, net_device_ctx))
+			return NOTIFY_DONE;
 	}
 
 	ret = netvsc_switch_datapath(ndev, vf_is_up);
@@ -2675,8 +2690,10 @@ static void netvsc_remove(struct hv_device *dev)
 	if (vf_netdev)
 		netvsc_unregister_vf(vf_netdev);
 
-	if (nvdev)
+	if (nvdev) {
+		netvsc_tx_disable(nvdev, net);
 		rndis_filter_device_remove(dev, nvdev);
+	}
 
 	unregister_netdevice(net);
 	list_del(&ndev_ctx->list);
