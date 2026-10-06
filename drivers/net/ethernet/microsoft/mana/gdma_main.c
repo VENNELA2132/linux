@@ -1883,6 +1883,17 @@ struct gdma_irq_context *mana_gd_get_gic(struct gdma_context *gc,
 		goto out;
 	}
 
+	if (dyn_msix && ops->setup_dyn_affinity) {
+		err = ops->setup_dyn_affinity(gc, irq, msi);
+		if (err) {
+			free_irq(irq, gic);
+			kfree(gic);
+			gic = ERR_PTR(err);
+			ops->msix_free(gc, msi, irq);
+			goto out;
+		}
+	}
+
 	gic->dyn_msix = dyn_msix;
 	refcount_set(&gic->refcount, 1);
 	gic->bitmap_refs = use_msi_bitmap ? 1 : 0;
@@ -1891,6 +1902,8 @@ struct gdma_irq_context *mana_gd_get_gic(struct gdma_context *gc,
 	if (err) {
 		dev_err(gc->dev, "Failed to store irq context for msi %d: %d\n",
 			msi, err);
+		if (dyn_msix)
+			irq_update_affinity_hint(irq, NULL);
 		free_irq(irq, gic);
 		kfree(gic);
 		gic = ERR_PTR(err);

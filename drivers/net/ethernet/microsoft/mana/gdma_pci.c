@@ -299,7 +299,7 @@ static int mana_pci_dev_reset(struct gdma_context *gc)
  */
 
 static int mana_irq_setup_numa_aware(unsigned int *irqs, unsigned int len,
-				     int node, bool skip_first_cpu)
+				     int node, unsigned int skip)
 {
 	const struct cpumask *next, *prev = cpu_none_mask;
 	cpumask_var_t cpus __free(free_cpumask_var);
@@ -317,8 +317,8 @@ static int mana_irq_setup_numa_aware(unsigned int *irqs, unsigned int len,
 				cpumask_andnot(cpus, cpus, topology_sibling_cpumask(cpu));
 				--weight;
 
-				if (unlikely(skip_first_cpu)) {
-					skip_first_cpu = false;
+				if (skip) {
+					skip--;
 					continue;
 				}
 
@@ -336,7 +336,8 @@ done:
 }
 
 /* must be called with cpus_read_lock() held */
-static void mana_irq_setup_linear(unsigned int *irqs, unsigned int len)
+static void mana_irq_setup_linear(unsigned int *irqs, unsigned int len,
+				  unsigned int skip)
 {
 	int cpu;
 
@@ -344,96 +345,33 @@ static void mana_irq_setup_linear(unsigned int *irqs, unsigned int len)
 		if (len == 0)
 			break;
 
+		if (skip) {
+			skip--;
+			continue;
+		}
+
 		irq_set_affinity_and_hint(*irqs++, cpumask_of(cpu));
 		len--;
 	}
 }
 
-static int mana_gd_setup_dyn_irqs(struct pci_dev *pdev, int nvec)
+/*
+ * Place a vector created on demand on the CPU a batch assignment would have
+ * given it. numa_aware() spends its first slot on the HWC IRQ, linear() does
+ * not, hence the different skip counts.
+ */
+static int mana_pci_setup_dyn_affinity(struct gdma_context *gc,
+				       unsigned int irq, unsigned int msi)
 {
-	struct gdma_context *gc = pci_get_drvdata(pdev);
-	struct gdma_irq_context *gic;
-	int *irqs, err, i, msi;
+	int err = 0;
 
-	irqs = kmalloc_objs(int, nvec);
-	if (!irqs)
-		return -ENOMEM;
-
-	/*
-	 * In this function, num_msix_usable = HWC IRQ + Queue IRQ.
-	 * nvec is only Queue IRQ (HWC already setup).
-	 * While processing the next pci irq vector, we start with index 1,
-	 * as IRQ vector at index 0 is already processed for HWC.
-	 * However, the population of irqs array starts with index 0, to be
-	 * further used in mana_irq_setup_numa_aware()
-	 */
-	for (i = 1; i <= nvec; i++) {
-		msi = i;
-		gic = mana_gd_get_gic(gc, false, &msi);
-		if (IS_ERR(gic)) {
-			err = PTR_ERR(gic);
-			goto free_irq;
-		}
-
-		irqs[i - 1] = gic->irq;
-	}
-
-	/*
-	 * When calling mana_irq_setup_numa_aware() for dynamically added IRQs,
-	 * if number of CPUs is more than or equal to allocated MSI-X, we need to
-	 * skip the first CPU sibling group since they are already affinitized to
-	 * HWC IRQ
-	 */
 	cpus_read_lock();
-	if (gc->num_msix_usable <= num_online_cpus()) {
-		err = mana_irq_setup_numa_aware(irqs, nvec, gc->numa_node,
-						true);
-		if (err) {
-			cpus_read_unlock();
-			goto free_irq;
-		}
-	} else {
-		/*
-		 * When num_msix_usable are more than num_online_cpus, our
-		 * queue IRQs should be equal to num of online vCPUs.
-		 * We try to make sure queue IRQs spread across all vCPUs.
-		 * In such a case NUMA or CPU core affinity does not matter.
-		 * Note: in this case the total mana IRQ should always be
-		 * num_online_cpus + 1. The first HWC IRQ is already handled
-		 * in HWC setup calls
-		 * However, if CPUs went offline since num_msix_usable was
-		 * computed, queue IRQs will be more than num_online_cpus().
-		 * In such cases remaining extra IRQs will retain their default
-		 * affinity.
-		 */
-		int first_unassigned = num_online_cpus();
-
-		if (nvec > first_unassigned) {
-			char buf[32];
-
-			if (first_unassigned == nvec - 1)
-				snprintf(buf, sizeof(buf), "%d",
-					 first_unassigned);
-			else
-				snprintf(buf, sizeof(buf), "%d-%d",
-					 first_unassigned, nvec - 1);
-
-			dev_dbg(&pdev->dev,
-				"MANA IRQ indices #%s will retain the default CPU affinity\n",
-				buf);
-		}
-
-		mana_irq_setup_linear(irqs, nvec);
-	}
-
+	if (gc->num_msix_usable <= num_online_cpus())
+		err = mana_irq_setup_numa_aware(&irq, 1, gc->numa_node, msi);
+	else
+		mana_irq_setup_linear(&irq, 1, msi ? msi - 1 : 0);
 	cpus_read_unlock();
-	kfree(irqs);
-	return 0;
 
-free_irq:
-	for (i -= 1; i > 0; i--)
-		mana_gd_put_gic(gc, false, i);
-	kfree(irqs);
 	return err;
 }
 
@@ -478,7 +416,7 @@ static int mana_gd_setup_irqs(struct pci_dev *pdev, int nvec)
 		nvec -= 1;
 	}
 
-	err = mana_irq_setup_numa_aware(irqs, nvec, gc->numa_node, false);
+	err = mana_irq_setup_numa_aware(irqs, nvec, gc->numa_node, 0);
 	if (err) {
 		cpus_read_unlock();
 		goto free_irq;
@@ -523,40 +461,6 @@ static int mana_gd_setup_hwc_irqs(struct pci_dev *pdev)
 	}
 
 	gc->num_msix_usable = nvec;
-	gc->max_num_msix = nvec;
-
-	return 0;
-}
-
-static int mana_gd_setup_remaining_irqs(struct pci_dev *pdev)
-{
-	struct gdma_context *gc = pci_get_drvdata(pdev);
-	struct msi_map irq_map;
-	int max_irqs, i, err;
-
-	if (!pci_msix_can_alloc_dyn(pdev))
-		/* remain irqs are already allocated with HWC IRQ */
-		return 0;
-
-	/* allocate only remaining IRQs*/
-	max_irqs = gc->num_msix_usable - 1;
-
-	for (i = 1; i <= max_irqs; i++) {
-		irq_map = pci_msix_alloc_irq_at(pdev, i, NULL);
-		if (!irq_map.virq) {
-			err = irq_map.index;
-			/* caller will handle cleaning up all allocated
-			 * irqs, after HWC is destroyed
-			 */
-			return err;
-		}
-	}
-
-	err = mana_gd_setup_dyn_irqs(pdev, max_irqs);
-	if (err)
-		return err;
-
-	gc->max_num_msix = gc->max_num_msix + max_irqs;
 
 	return 0;
 }
@@ -564,17 +468,12 @@ static int mana_gd_setup_remaining_irqs(struct pci_dev *pdev)
 static void mana_gd_remove_irqs(struct pci_dev *pdev)
 {
 	struct gdma_context *gc = pci_get_drvdata(pdev);
-	int i;
+	struct gdma_irq_context *gic;
+	unsigned long msi;
 
-	if (gc->max_num_msix < 1)
-		return;
-
-	for (i = 0; i < gc->max_num_msix; i++) {
-		if (!xa_load(&gc->irq_contexts, i))
-			continue;
-
-		mana_gd_put_gic(gc, false, i);
-	}
+	/* Only the vectors an EQ asked for were ever created */
+	xa_for_each(&gc->irq_contexts, msi, gic)
+		mana_gd_put_gic(gc, false, msi);
 
 	WARN_ON(!xa_empty(&gc->irq_contexts));
 
@@ -582,7 +481,6 @@ static void mana_gd_remove_irqs(struct pci_dev *pdev)
 
 	bitmap_free(gc->msi_bitmap);
 	gc->msi_bitmap = NULL;
-	gc->max_num_msix = 0;
 	gc->num_msix_usable = 0;
 }
 
@@ -593,14 +491,6 @@ static int mana_pci_setup_hwc_irqs(struct gdma_context *gc)
 
 static int mana_pci_setup_remaining_irqs(struct gdma_context *gc)
 {
-	int err;
-
-	err = mana_gd_setup_remaining_irqs(to_pci_dev(gc->dev));
-	if (err) {
-		dev_err(gc->dev, "Failed to setup remaining IRQs: %d", err);
-		return err;
-	}
-
 	if (!gc->msi_sharing) {
 		gc->msi_bitmap = bitmap_zalloc(gc->num_msix_usable, GFP_KERNEL);
 		if (!gc->msi_bitmap)
@@ -624,6 +514,7 @@ static const struct gdma_bus_ops mana_pci_bus_ops = {
 	.msix_virq		= mana_pci_msix_virq,
 	.msix_alloc_at		= mana_pci_msix_alloc_at,
 	.msix_free		= mana_pci_msix_free,
+	.setup_dyn_affinity	= mana_pci_setup_dyn_affinity,
 	.msix_vec_count		= mana_pci_msix_vec_count,
 	.setup_hwc_irqs		= mana_pci_setup_hwc_irqs,
 	.setup_remaining_irqs	= mana_pci_setup_remaining_irqs,
