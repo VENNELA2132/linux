@@ -980,7 +980,13 @@ static void vmbus_device_release(struct device *device)
 	hv_debug_rm_dev_dir(hv_dev);
 
 	mutex_lock(&vmbus_connection.channel_mutex);
-	hv_process_channel_removal(channel);
+	/*
+	 * Registration failures release the device before channel setup has
+	 * published its cleanup owner. Leave the channel to the offer worker,
+	 * or to a rescind worker that has claimed it.
+	 */
+	if (READ_ONCE(channel->probe_done))
+		hv_process_channel_removal(channel);
 	mutex_unlock(&vmbus_connection.channel_mutex);
 	kfree(hv_dev);
 }
@@ -2728,6 +2734,7 @@ static int vmbus_bus_suspend(struct device *dev)
 	drain_workqueue(vmbus_connection.work_queue);
 	drain_workqueue(vmbus_connection.handle_primary_chan_wq);
 	drain_workqueue(vmbus_connection.handle_sub_chan_wq);
+	drain_workqueue(vmbus_connection.rescind_remove_work_queue);
 
 	mutex_lock(&vmbus_connection.channel_mutex);
 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {

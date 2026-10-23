@@ -199,9 +199,21 @@ int vmbus_connect(void)
 		goto cleanup;
 	}
 
+	/*
+	 * Publish rescinds concurrently so one device teardown cannot keep
+	 * another rescind from waking a channel waiter. Potentially blocking
+	 * device removal runs on the separate workqueue below.
+	 */
 	vmbus_connection.rescind_work_queue =
-		create_workqueue("hv_vmbus_rescind");
+		alloc_workqueue("hv_vmbus_rescind", WQ_UNBOUND, 0);
 	if (!vmbus_connection.rescind_work_queue) {
+		ret = -ENOMEM;
+		goto cleanup;
+	}
+
+	vmbus_connection.rescind_remove_work_queue =
+		alloc_workqueue("hv_vmbus_rescind_remove", WQ_UNBOUND, 0);
+	if (!vmbus_connection.rescind_remove_work_queue) {
 		ret = -ENOMEM;
 		goto cleanup;
 	}
@@ -368,6 +380,9 @@ void vmbus_disconnect(void)
 
 	if (vmbus_connection.rescind_work_queue)
 		destroy_workqueue(vmbus_connection.rescind_work_queue);
+
+	if (vmbus_connection.rescind_remove_work_queue)
+		destroy_workqueue(vmbus_connection.rescind_remove_work_queue);
 
 	if (vmbus_connection.work_queue)
 		destroy_workqueue(vmbus_connection.work_queue);

@@ -801,7 +801,18 @@ struct vmbus_channel {
 
 	bool rescind; /* got rescind msg */
 	bool rescind_ref; /* got rescind msg, got channel reference */
+	/*
+	 * Set by vmbus_disconnect_ring() under channel_mutex to claim a sub
+	 * channel. While it is set the channel must not be freed by anyone
+	 * else; rescind removal leaves the teardown to the closer.
+	 */
+	bool closer_owns;
+	bool close_visited;
+	bool setup_failed;
+	atomic_t suspend_cleanup_done;
 	struct completion rescind_event;
+	struct completion probe_event;
+	struct work_struct rescind_work;
 
 	struct vmbus_gpadl ringbuffer_gpadlhandle;
 

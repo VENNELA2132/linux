@@ -291,6 +291,7 @@ struct vmbus_connection {
 	struct workqueue_struct *handle_primary_chan_wq;
 	struct workqueue_struct *handle_sub_chan_wq;
 	struct workqueue_struct *rescind_work_queue;
+	struct workqueue_struct *rescind_remove_work_queue;
 
 	/*
 	 * On suspension of the vmbus, the accumulated offer messages
@@ -415,6 +416,8 @@ void vmbus_remove_channel_attr_group(struct vmbus_channel *channel);
 
 void vmbus_channel_map_relid(struct vmbus_channel *channel);
 void vmbus_channel_unmap_relid(struct vmbus_channel *channel);
+void vmbus_remove_failed_channel(struct vmbus_channel *channel);
+void vmbus_rescind_cleanup_done(struct vmbus_channel *channel);
 
 struct vmbus_channel *relid2channel(u32 relid);
 
